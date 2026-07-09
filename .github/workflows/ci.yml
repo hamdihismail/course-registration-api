@@ -39,8 +39,10 @@ jobs:
             --exclude=venv,.venv,__pycache__
 
       - name: Run tests with minimum 80 percent coverage
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest -v \
+          python -m pytest -v \
             --cov=main \
             --cov-report=term-missing \
             --cov-report=xml \
