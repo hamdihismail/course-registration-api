@@ -26,23 +26,34 @@ def normalize_course_code(course_code: str) -> str:
 
 def extract_course_codes(text: str) -> list[str]:
     """
-    Extracts course codes from messy prerequisite or cross-listed text.
+    Extracts course codes from prerequisite and cross-listed text.
 
-    Examples:
-    - "COSC 2006"
-    - "Requires COSC 1046 and either COSC 1047 or ITEC 1047"
-    - "COSC 3506, ITEC 3506"
+    Supports formats such as:
+    - COSC 2006
+    - COSC-2006
+    - COSC2006
+    - Requires COSC-1046 and either COSC 1047 or ITEC-1047
     """
     if not text:
         return []
 
-    if text.strip().lower() in ["none", "n/a", ""]:
+    cleaned_text = text.strip()
+
+    if cleaned_text.lower() in {"none", "n/a", ""}:
         return []
 
-    pattern = r"\b[A-Z]{3,4}\s*\d{4}\b"
-    matches = re.findall(pattern, text.upper())
+    pattern = r"\b[A-Z]{3,4}[\s-]*\d{4}\b"
+    matches = re.findall(pattern, cleaned_text.upper())
 
-    return [normalize_course_code(match) for match in matches]
+    normalized_codes = []
+
+    for match in matches:
+        normalized_code = normalize_course_code(match)
+
+        if normalized_code not in normalized_codes:
+            normalized_codes.append(normalized_code)
+
+    return normalized_codes
 
 
 def parse_catalog_html(html_content: str) -> dict:

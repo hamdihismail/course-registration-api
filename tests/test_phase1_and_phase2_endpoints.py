@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from main import app, catalog
+from main import app, catalog, extract_course_codes
 
 client = TestClient(app)
 
@@ -19,6 +19,24 @@ def test_root_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json()["message"] == ("Course Registration API is running")
+
+
+def test_extract_course_codes_supports_hyphens() -> None:
+    result = extract_course_codes(
+        "Requires COSC-3127 and either COSC 3506 or ITEC-3506"
+    )
+
+    assert result == [
+        "COSC3127",
+        "COSC3506",
+        "ITEC3506",
+    ]
+
+
+def test_extract_cross_listed_hyphenated_code() -> None:
+    result = extract_course_codes("Cross-listed with COSC-3506")
+
+    assert result == ["COSC3506"]
 
 
 def test_catalog_import_and_lookup() -> None:
@@ -194,3 +212,50 @@ def test_unknown_student_operations_return_404() -> None:
         ).status_code
         == 404
     )
+
+
+def test_catalog_import_parses_hyphenated_relationships() -> None:
+    html = """
+    <html>
+    <body>
+        <table>
+            <tr>
+                <th>Course Code</th>
+                <th>Title</th>
+                <th>Credits</th>
+                <th>Prerequisites</th>
+                <th>Cross-listed</th>
+            </tr>
+            <tr>
+                <td>COSC-4426</td>
+                <td>Advanced Software</td>
+                <td>3</td>
+                <td>COSC-3127</td>
+                <td>ITEC-4426</td>
+            </tr>
+        </table>
+    </body>
+    </html>
+    """
+
+    response = client.post(
+        "/api/v1/admin/catalog/import",
+        files={
+            "file": (
+                "catalog.html",
+                html.encode("utf-8"),
+                "text/html",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+
+    course_response = client.get("/api/v1/catalog/courses/COSC-4426")
+
+    assert course_response.status_code == 200
+
+    course = course_response.json()
+
+    assert course["prerequisites"] == ["COSC3127"]
+    assert course["cross_listed"] == ["ITEC4426"]

@@ -422,3 +422,80 @@ def test_remaining_credits_never_go_below_zero() -> None:
 
     assert summary["total_earned"] == 123
     assert summary["total_remaining_for_graduation"] == 0
+
+
+def test_hidden_style_missing_prerequisite() -> None:
+    catalog["COSC4426"] = {
+        "course_code": "COSC4426",
+        "title": "Advanced Test Course",
+        "credits": 3,
+        "prerequisites": ["COSC3127"],
+        "cross_listed": [],
+    }
+
+    app.state.students["770001"] = {
+        "history": [],
+        "plan": [
+            PlannedCourse(
+                course_code="COSC-4426",
+                term="26F",
+            )
+        ],
+    }
+
+    response = client.get("/api/v1/students/770001/audit-report")
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["status"] == "warning"
+    assert len(body["timeline_validation"]) == 1
+
+    error = body["timeline_validation"][0]["errors"][0]
+
+    assert error["course_code"] == "COSC-4426"
+    assert error["type"] == "MISSING_PREREQUISITE"
+    assert error["message"] == "Missing prerequisite: COSC3127"
+
+
+def test_hidden_style_cross_list_conflict() -> None:
+    catalog["ITEC3506"] = {
+        "course_code": "ITEC3506",
+        "title": "Software Systems Development",
+        "credits": 3,
+        "prerequisites": [],
+        "cross_listed": ["COSC3506"],
+    }
+
+    app.state.students["770001"] = {
+        "history": [
+            HistoryCourse(
+                course_code="COSC-3506",
+                term="25F",
+                credits_earned=3,
+                status="Completed",
+            )
+        ],
+        "plan": [
+            PlannedCourse(
+                course_code="ITEC-3506",
+                term="26F",
+            )
+        ],
+    }
+
+    response = client.get("/api/v1/students/770001/audit-report")
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["status"] == "warning"
+    assert len(body["cross_list_violations"]) == 1
+
+    violation = body["cross_list_violations"][0]
+
+    assert violation["course_code"] == "ITEC-3506"
+    assert violation["type"] == "CROSS_LIST_CONFLICT"
+    assert violation["message"] == "Cross-listed with completed course COSC-3506"
