@@ -1,4 +1,13 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 .env
+uvicorn.log
+uvicorn.pid
+tests/integration_output/

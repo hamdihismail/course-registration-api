@@ -1,5 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Query
 from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Any, Optional
@@ -7,20 +6,23 @@ import asyncio
 from pydantic import BaseModel, Field
 
 app = FastAPI(
-        title="Course Registration API",
-        description="Phase 2 API",
-        version="1.0.0"
+    title="Course Registration API", description="Phase 2 API", version="1.0.0"
 )
 
 # In-memory storage for Phase 1
 catalog = {}
+
 
 def normalize_course_code(course_code: str) -> str:
     """
     Normalizes course codes so COSC 3506, cosc3506, and COSC3506
     can be treated consistently.
     """
-    return re.sub(r"\s+", "", course_code.strip().upper())
+    if not course_code:
+        return ""
+
+    return re.sub(r"[\s-]+", "", course_code.strip().upper())
+
 
 def extract_course_codes(text: str) -> list[str]:
     """
@@ -94,13 +96,14 @@ def parse_catalog_html(html_content: str) -> dict:
             "title": title,
             "credits": credits,
             "prerequisites": extract_course_codes(prerequisites_raw),
-            "cross_listed": extract_course_codes(cross_listed_raw)
+            "cross_listed": extract_course_codes(cross_listed_raw),
         }
 
     if not parsed_courses:
         raise ValueError("No valid courses could be parsed from the uploaded file.")
 
     return parsed_courses
+
 
 class HistoryCourse(BaseModel):
     course_code: str
@@ -125,6 +128,7 @@ class PlanRequest(BaseModel):
 class StudentRecord(BaseModel):
     history: List[HistoryCourse] = Field(default_factory=list)
     plan: List[PlannedCourse] = Field(default_factory=list)
+
 
 app.state.students = {}
 app.state.students_lock = asyncio.Lock()
@@ -229,7 +233,7 @@ def parse_transcript_html(html: str) -> List[HistoryCourse]:
         if header_map is None or header_row_index is None:
             continue
 
-        for row in rows[header_row_index + 1:]:
+        for row in rows[header_row_index + 1 :]:
             cells = get_cell_texts(row)
 
             needed_index = max(header_map.values())
@@ -285,12 +289,335 @@ def serialize_history(history: List[HistoryCourse]) -> List[Dict[str, Any]]:
 def serialize_plan(plan: List[PlannedCourse]) -> List[Dict[str, Any]]:
     return [course.model_dump() for course in plan]
 
+
+def term_sort_key(term: str) -> tuple[int, int]:
+    # """
+    # Converts terms into sortable values.
+
+    # Required order:
+    # W < SP < S < F
+
+    # Examples:
+    # 23F  -> (23, 4)
+    # 24W  -> (24, 1)
+    # 26SP -> (26, 2)
+    # 26S  -> (26, 3)
+    # 26F  -> (26, 4)
+    # """
+    if not term:
+        return (999, 999)
+
+    term = term.upper().strip()
+
+    match = re.match(r"^(\d{2})(W|SP|S|F)$", term)
+    if not match:
+        return (999, 999)
+
+    year = int(match.group(1))
+    season = match.group(2)
+
+    season_order = {
+        "W": 1,
+        "SP": 2,
+        "S": 3,
+        "F": 4,
+    }
+
+    return (year, season_order[season])
+
+
+def is_strictly_earlier(term_a: str, term_b: str) -> bool:
+    """
+    Returns True if term_a happens before term_b.
+    """
+    return term_sort_key(term_a) < term_sort_key(term_b)
+
+
+def clean_course_list(value) -> list[str]:
+    """
+    Normalizes prerequisites/cross-listed values into a list.
+
+    This protects you in case your Phase 1 parser stored:
+    - a list
+    - a comma-separated string
+    - None
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    if isinstance(value, str):
+        if not value.strip() or value.strip().lower() == "none":
+            return []
+
+        parts = re.split(r",|;|/|\band\b", value, flags=re.IGNORECASE)
+        return [part.strip() for part in parts if part.strip()]
+
+    return []
+
+
+def get_course_value(
+    course: Any,
+    field_name: str,
+    default: Any = None,
+) -> Any:
+    """
+    Reads a value from either:
+    - a Pydantic model, such as HistoryCourse or PlannedCourse
+    - a dictionary
+
+    This keeps the Phase 3 logic compatible with the Phase 2 storage format.
+    """
+    if isinstance(course, dict):
+        return course.get(field_name, default)
+
+    return getattr(course, field_name, default)
+
+
+def get_completed_courses_by_code(
+    history: List[HistoryCourse],
+) -> Dict[str, HistoryCourse]:
+    """
+    Returns one completed course per normalized course code.
+
+    Non-completed attempts do not count.
+    If a completed course appears more than once, the latest completed
+    occurrence replaces the earlier one.
+    """
+    completed: Dict[str, HistoryCourse] = {}
+
+    sorted_history = sorted(
+        history,
+        key=lambda item: term_sort_key(get_course_value(item, "term", "")),
+    )
+
+    for item in sorted_history:
+        course_status = get_course_value(item, "status", "")
+
+        if course_status != "Completed":
+            continue
+
+        course_code = get_course_value(item, "course_code", "")
+        normalized_code = normalize_course_code(course_code)
+
+        completed[normalized_code] = item
+
+    return completed
+
+
+def validate_prerequisites(
+    plan: List[PlannedCourse],
+    history: List[HistoryCourse],
+    catalog: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Checks that every prerequisite was completed in a strictly earlier term.
+    """
+    errors_by_term: Dict[str, List[Dict[str, str]]] = {}
+
+    completed_history = [
+        item for item in history if get_course_value(item, "status", "") == "Completed"
+    ]
+
+    for planned_course in plan:
+        planned_code = get_course_value(
+            planned_course,
+            "course_code",
+            "",
+        )
+        planned_term = get_course_value(
+            planned_course,
+            "term",
+            "",
+        )
+
+        planned_normalized = normalize_course_code(planned_code)
+        catalog_course = catalog.get(planned_normalized)
+
+        if catalog_course is None:
+            continue
+
+        prerequisites = clean_course_list(catalog_course.get("prerequisites"))
+
+        for prerequisite_code in prerequisites:
+            prerequisite_normalized = normalize_course_code(prerequisite_code)
+
+            prerequisite_completed_before = False
+
+            for completed_course in completed_history:
+                completed_code = get_course_value(
+                    completed_course,
+                    "course_code",
+                    "",
+                )
+                completed_term = get_course_value(
+                    completed_course,
+                    "term",
+                    "",
+                )
+
+                completed_normalized = normalize_course_code(completed_code)
+
+                if (
+                    completed_normalized == prerequisite_normalized
+                    and is_strictly_earlier(
+                        completed_term,
+                        planned_term,
+                    )
+                ):
+                    prerequisite_completed_before = True
+                    break
+
+            if not prerequisite_completed_before:
+                errors_by_term.setdefault(
+                    planned_term,
+                    [],
+                ).append(
+                    {
+                        "course_code": planned_code,
+                        "type": "MISSING_PREREQUISITE",
+                        "message": (f"Missing prerequisite: " f"{prerequisite_code}"),
+                    }
+                )
+
+    timeline_validation: List[Dict[str, Any]] = []
+
+    for term in sorted(
+        errors_by_term.keys(),
+        key=term_sort_key,
+    ):
+        timeline_validation.append(
+            {
+                "term": term,
+                "errors": errors_by_term[term],
+            }
+        )
+
+    return timeline_validation
+
+
+def validate_cross_listings(
+    plan: List[PlannedCourse],
+    history: List[HistoryCourse],
+    catalog: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """
+    Checks whether a planned course is cross-listed with a course
+    the student already completed.
+    """
+    violations: List[Dict[str, str]] = []
+
+    completed_by_code = get_completed_courses_by_code(history)
+    completed_codes = set(completed_by_code.keys())
+
+    for planned_course in plan:
+        planned_code = get_course_value(
+            planned_course,
+            "course_code",
+            "",
+        )
+
+        planned_normalized = normalize_course_code(planned_code)
+        catalog_course = catalog.get(planned_normalized)
+
+        if catalog_course is None:
+            continue
+
+        cross_listed_courses = clean_course_list(catalog_course.get("cross_listed"))
+
+        for cross_listed_code in cross_listed_courses:
+            cross_normalized = normalize_course_code(cross_listed_code)
+
+            if cross_normalized not in completed_codes:
+                continue
+
+            completed_course = completed_by_code[cross_normalized]
+
+            completed_display_code = get_course_value(
+                completed_course,
+                "course_code",
+                cross_listed_code,
+            )
+
+            violations.append(
+                {
+                    "course_code": planned_code,
+                    "type": "CROSS_LIST_CONFLICT",
+                    "message": (
+                        "Cross-listed with completed course "
+                        f"{completed_display_code}"
+                    ),
+                }
+            )
+
+    return violations
+
+
+GRADUATION_TARGET = 120
+
+
+def calculate_credit_summary(
+    plan: List[PlannedCourse],
+    history: List[HistoryCourse],
+    catalog: Dict[str, Dict[str, Any]],
+) -> Dict[str, int]:
+    """
+    Calculates earned, planned, and remaining graduation credits.
+    """
+    completed_by_code = get_completed_courses_by_code(history)
+
+    total_earned = 0
+
+    for completed_course in completed_by_code.values():
+        credits_earned = get_course_value(
+            completed_course,
+            "credits_earned",
+            0,
+        )
+
+        try:
+            total_earned += int(credits_earned)
+        except (TypeError, ValueError):
+            continue
+
+    total_planned = 0
+
+    for planned_course in plan:
+        planned_code = get_course_value(
+            planned_course,
+            "course_code",
+            "",
+        )
+
+        planned_normalized = normalize_course_code(planned_code)
+        catalog_course = catalog.get(planned_normalized)
+
+        if catalog_course is None:
+            continue
+
+        try:
+            total_planned += int(catalog_course.get("credits", 0))
+        except (TypeError, ValueError):
+            continue
+
+    total_remaining = max(
+        0,
+        GRADUATION_TARGET - total_earned - total_planned,
+    )
+
+    return {
+        "total_earned": total_earned,
+        "total_planned": total_planned,
+        "total_remaining_for_graduation": total_remaining,
+    }
+
+
 @app.get("/")
 def root():
-    return {
-        "message": "Course Registration API is running",
-        "docs": "/docs"
-    }
+    return {"message": "Course Registration API is running", "docs": "/docs"}
+
 
 @app.post("/api/v1/admin/catalog/import")
 async def import_catalog(file: UploadFile = File(...)):
@@ -298,10 +625,7 @@ async def import_catalog(file: UploadFile = File(...)):
     Uploads and imports an HTML course catalog.
     """
     if not file.filename.lower().endswith((".html", ".htm")):
-        raise HTTPException(
-            status_code=400,
-            detail="Only HTML files are accepted."
-        )
+        raise HTTPException(status_code=400, detail="Only HTML files are accepted.")
 
     try:
         contents = await file.read()
@@ -315,27 +639,24 @@ async def import_catalog(file: UploadFile = File(...)):
 
         return {
             "message": "Catalog imported successfully.",
-            "courses_imported": len(catalog)
+            "courses_imported": len(catalog),
         }
 
     except UnicodeDecodeError:
         raise HTTPException(
-            status_code=400,
-            detail="Uploaded file must be valid UTF-8 HTML."
+            status_code=400, detail="Uploaded file must be valid UTF-8 HTML."
         )
 
     except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error)
-        )
+        raise HTTPException(status_code=400, detail=str(error))
 
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Unexpected error while importing catalog: {str(error)}"
+            detail=f"Unexpected error while importing catalog: {str(error)}",
         )
-    
+
+
 @app.get("/api/v1/catalog/courses/{course_code}")
 def get_course(course_code: str):
     """
@@ -346,10 +667,7 @@ def get_course(course_code: str):
     course = catalog.get(normalized_code)
 
     if course is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Course not found."
-        )
+        raise HTTPException(status_code=404, detail="Course not found.")
 
     return course
 
@@ -444,4 +762,53 @@ async def get_student_profile(student_id: str):
         "student_id": student_id,
         "history": serialize_history(student["history"]),
         "plan": serialize_plan(student["plan"]),
+    }
+
+
+@app.get("/api/v1/students/{student_id}/audit-report")
+async def get_audit_report(
+    student_id: str,
+    strict: bool = Query(default=False),
+):
+    # if student_id not in get_student_or_404(student_id):
+    #     raise HTTPException(status_code=404, detail="Student not found")
+
+    student = get_student_or_404(student_id)
+
+    history = student.get("history", [])
+    plan = student.get("plan", [])
+
+    timeline_validation = validate_prerequisites(
+        plan=plan,
+        history=history,
+        catalog=catalog,
+    )
+
+    cross_list_violations = validate_cross_listings(
+        plan=plan,
+        history=history,
+        catalog=catalog,
+    )
+
+    credit_summary = calculate_credit_summary(
+        plan=plan,
+        history=history,
+        catalog=catalog,
+    )
+
+    has_issues = bool(timeline_validation or cross_list_violations)
+
+    if not has_issues:
+        audit_status = "ok"
+    elif strict:
+        audit_status = "failed"
+    else:
+        audit_status = "warning"
+
+    return {
+        "student_id": student_id,
+        "status": audit_status,
+        "timeline_validation": timeline_validation,
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": credit_summary,
     }

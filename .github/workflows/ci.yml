@@ -1,0 +1,88 @@
+name: Phase 3 CI Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check formatting with Black
+        run: |
+          black --check main.py tests
+
+      - name: Run Flake8 lint
+        run: |
+          flake8 main.py tests \
+            --max-line-length=88 \
+            --extend-ignore=E203 \
+            --exclude=venv,.venv,__pycache__
+
+      - name: Run tests with minimum 80 percent coverage
+        run: |
+          pytest -v \
+            --cov=main \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80
+
+      - name: Start FastAPI application
+        run: |
+          uvicorn main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+      - name: Wait for API to become ready
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent \
+              http://127.0.0.1:8000/ > /dev/null; then
+              echo "API is ready."
+              exit 0
+            fi
+
+            echo "Waiting for API... attempt ${attempt}"
+            sleep 1
+          done
+
+          echo "API failed to start."
+          cat uvicorn.log
+          exit 1
+
+      - name: Run API integration test
+        run: |
+          bash tests/run_integration.sh
+
+      - name: Display server log
+        if: always()
+        run: |
+          cat uvicorn.log || true
+
+      - name: Stop FastAPI application
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill "$(cat uvicorn.pid)" || true
+          fi
